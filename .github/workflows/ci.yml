@@ -1,0 +1,130 @@
+# PR0 baseline CI: builds the existing frontend, runs the existing regression tests and
+# syntax-checks the backend and launcher scripts. It changes no product code.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same Node.js release the setup scripts download as the portable runtime
+  NODE_VERSION: "22.12.0"
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x64, Windows x64, Apple Silicon macOS, Intel macOS
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: app/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: app/frontend
+        run: npm run build
+
+      - name: Check build output
+        shell: bash
+        run: test -f app/dist/index.html
+
+      # The regression tests import app/frontend/src/services/api.js, which needs the
+      # frontend's node_modules, so they run after npm ci
+      - name: Run regression tests
+        run: node --test "scripts/tests/*.test.cjs"
+
+  backend-syntax:
+    name: Backend syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Check Node.js scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find scripts -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -print0 |
+            while IFS= read -r -d '' file; do
+              echo "node --check $file"
+              node --check "$file"
+            done
+
+      - name: Check Python workers and setup helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          find scripts -type f -name '*.py' -print0 |
+            xargs -0 python3 -c 'import ast, sys
+          for path in sys.argv[1:]:
+              print("parse", path)
+              with open(path, encoding="utf-8") as handle:
+                  ast.parse(handle.read(), path)'
+
+  shell-syntax:
+    name: Shell syntax (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS checks against its bundled bash 3.2, which runs mac.sh for users
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          /bin/bash --version | head -1
+          for file in linux.sh mac.sh $(git ls-files 'scripts/*.sh'); do
+            echo "bash -n $file"
+            /bin/bash -n "$file"
+          done
+
+  powershell-syntax:
+    name: PowerShell syntax
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Path scripts -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Host "::error file=$($_.Extent.File),line=$($_.Extent.StartLineNumber)::$($_.Message)" }
+            } else {
+              Write-Host "parsed $($_.FullName)"
+            }
+          }
+          if ($failed) { exit 1 }
